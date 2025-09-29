@@ -1,0 +1,1746 @@
+
+# this code is for the nomarl ppo training and test
+# you can also improve the state or reward or more steps 
+
+# lagrange ppo
+import argparse
+import copy
+import os
+import random
+import mmcv
+import numpy as np
+import time
+import torch
+from mmcv import Config
+from mmcv.parallel import MMDistributedDataParallel
+from mmcv.runner import load_checkpoint
+from torchpack import distributed as dist
+from torchpack.utils.config import configs
+from tqdm import tqdm
+from mmcv.parallel import scatter
+from mmdet3d.core import LiDARInstance3DBoxes
+from mmdet3d.core.utils import visualize_camera, visualize_lidar_two, visualize_lidar_two_combo, visualize_map
+from mmdet3d.datasets import build_dataloader, build_dataset
+from mmdet3d.models2 import build_coop_model
+from mmdet3d.core.bbox.iou_calculators.iou3d_calculator import bbox_overlaps_3d
+import torchvision.transforms.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+# from mmdet3d.core.bbox.iou_calculators import bbox_overlaps_3d
+import cv2
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import os
+import json
+from mmdet3d.core.bbox.structures import LiDARInstance3DBoxes
+from mmdet3d.ops.iou3d import boxes_iou_bev
+import torch.nn.functional as F
+from mmdet3d.core.bbox.structures import BaseInstance3DBoxes, Box3DMode
+from scipy.optimize import linear_sum_assignment
+
+from collections import deque
+
+from yolov5.models.common import DetectMultiBackend
+from yolov5.utils.general import non_max_suppression, scale_coords
+# from yolov5.utils.datasets import LoadImages
+from yolov5.utils.torch_utils import select_device
+
+
+
+import numpy as np
+import torch
+from mmdet3d.core.bbox.iou_calculators.iou3d_calculator import bbox_overlaps_3d
+from mmdet3d.core.bbox.structures import BaseInstance3DBoxes, Box3DMode
+from scipy.optimize import linear_sum_assignment
+
+
+
+def eval_one_frame_nus_centerdist(
+    gt_boxes, gt_labels,
+    pred_boxes, pred_labels,
+    dist_thrs=(2.0,),       
+    classwise=True,
+    return_matches=False   
+):
+   
+    assert isinstance(gt_boxes, BaseInstance3DBoxes) and isinstance(pred_boxes, BaseInstance3DBoxes)
+
+    # 取 BEV 中心 (x,y)
+    gt_xy   = gt_boxes.center[:, :2].detach().cpu().numpy()
+    pred_xy = pred_boxes.center[:, :2].detach().cpu().numpy()
+    Ng, Np = len(gt_xy), len(pred_xy)
+
+    gt_labels   = np.asarray(gt_labels).astype(int)
+    pred_labels = np.asarray(pred_labels).astype(int)
+
+ 
+    def _empty_results():
+        res, details = {}, {}
+        for t in np.atleast_1d(dist_thrs).astype(float):
+            TP = 0; FP = Np; FN = Ng
+            prec = 0.0 if (TP+FP)==0 else TP/(TP+FP)
+            rec  = 0.0 if (TP+FN)==0 else TP/(TP+FN)
+            f1   = 0.0 if (prec+rec)==0 else 2*prec*rec/(prec+rec)
+            res[t] = dict(tp=TP, fp=FP, fn=FN, precision=prec, recall=rec, f1=f1, mean_center_dist=None)
+            details[t] = []
+        return (res, details) if return_matches else res
+
+    if Np==0 or Ng==0:
+        print("NP",Np,"NG", Ng)
+        return _empty_results()
+
+  
+    diff = pred_xy[:, None, :] - gt_xy[None, :, :]
+    dmat = np.sqrt((diff ** 2).sum(axis=-1))  
+
+
+    classes = np.union1d(pred_labels, gt_labels) if classwise else [None]
+
+ 
+    per_class_pairs = []  # [(dist_array_for_pairs, num_pred_in_cls, num_gt_in_cls, pidx_list, gidx_list, ri, cj)]
+    for c in classes:
+        if c is None:
+            pidx = np.arange(Np); gidx = np.arange(Ng); sub = dmat
+        else:
+            pidx = np.where(pred_labels == c)[0]
+            gidx = np.where(gt_labels == c)[0]
+            if len(pidx)==0 and len(gidx)==0:
+                continue
+            sub = dmat[np.ix_(pidx, gidx)] if (len(pidx)>0 and len(gidx)>0) else np.zeros((len(pidx), len(gidx)), dtype=float)
+
+        if sub.size == 0:
+            per_class_pairs.append((np.array([]), len(pidx), len(gidx), pidx, gidx, np.array([],dtype=int), np.array([],dtype=int)))
+        else:
+            ri, cj = linear_sum_assignment(sub)    
+            per_class_pairs.append((sub[ri, cj], len(pidx), len(gidx), pidx, gidx, ri, cj))
+
+    results = {}
+    all_matches = {}  # thr -> [(pi,gi,dist)]
+    for thr in np.atleast_1d(dist_thrs).astype(float):
+        TP=FP=FN=0
+        tp_dists = []
+        matches = []
+
+        for dsel, np_cls, ng_cls, pidx, gidx, ri, cj in per_class_pairs:
+            if dsel.size == 0:
+                TPc = 0; FPc = np_cls; FNc = ng_cls
+            else:
+                ok = (dsel <= thr)
+                TPc = int(ok.sum())
+                FPc = np_cls - TPc
+                FNc = ng_cls - TPc
+              
+                for k, good in enumerate(ok):
+                    if good:
+                        pi = int(pidx[ri[k]]); gi = int(gidx[cj[k]])
+                        dist = float(dsel[k])
+                        matches.append((pi, gi, dist))
+                        tp_dists.append(dist)
+
+            TP += TPc; FP += FPc; FN += FNc
+
+        prec = 0.0 if (TP+FP)==0 else TP/(TP+FP)
+        rec  = 0.0 if (TP+FN)==0 else TP/(TP+FN)
+        f1   = 0.0 if (prec+rec)==0 else 2*prec*rec/(prec+rec)
+        mean_cdist = float(np.mean(tp_dists)) if tp_dists else None
+
+        results[thr] = dict(tp=int(TP), fp=int(FP), fn=int(FN),
+                            precision=float(prec), recall=float(rec),
+                            f1=float(f1), mean_center_dist=mean_cdist)
+        all_matches[thr] = matches
+    
+    # return (results, all_matches) if return_matches else results
+    print("f1", f1)
+    return f1
+
+
+
+
+def _to_lidar7(boxes):
+    # 你自己的 to_lidar7；确保顺序是 [x,y,z, dx,dy,dz, yaw]
+    # 若 boxes 已是 LiDARInstance3DBoxes，可直接：
+    t = boxes.tensor.detach().cpu().numpy()
+    # 若是 9 维 [x,y,z,dx,dy,dz,yaw,vx,vy]，截到前7
+    if t.shape[1] >= 7:
+        t = t[:, :7]
+    return t
+
+def _center_dist_matrix(pred7, gt7):
+    P, G = len(pred7), len(gt7)
+    D = np.zeros((P, G), dtype=np.float32)
+    for i in range(P):
+        for j in range(G):
+            dx = pred7[i,0] - gt7[j,0]
+            dy = pred7[i,1] - gt7[j,1]
+            dz = pred7[i,2] - gt7[j,2]
+            D[i,j] = np.sqrt(dx*dx + dy*dy + dz*dz)
+    return D
+
+
+def _bev_iou_matrix(pred_boxes, gt_boxes):
+
+
+
+    # 先尝试用 mmdet3d 的 BEV IoU（0.x 版本常见位置）
+    # try:
+    from mmdet3d.ops.iou3d.iou3d_utils import boxes_iou_bev
+
+    def xy_dxdyyaw(boxes):
+        # boxes.tensor: [x, y, z, dx, dy, dz, yaw, (vx,vy)]
+        t = boxes.tensor.detach()
+        if t.shape[1] < 7:
+            raise ValueError("boxes tensor must have at least 7 dims: [x,y,z,dx,dy,dz,yaw]")
+        return torch.stack([t[:, 0], t[:, 1], t[:, 3], t[:, 4], t[:, 6]], dim=1).float()
+
+    A = xy_dxdyyaw(pred_boxes)  # [N,5] = x,y,dx,dy,yaw
+    B = xy_dxdyyaw(gt_boxes)    # [M,5]
+    if not A.is_cuda:
+        A = A.cuda()
+    if not B.is_cuda:  
+        B = B.cuda()
+    
+    iou = boxes_iou_bev(A, B)  # 期望返回 [N,M] 的张量
+    if torch.is_tensor(iou):
+        return iou.detach().cpu().numpy()
+    else:
+        return np.asarray(iou, dtype=np.float32)
+
+    # except Exception:
+    #     # 回退到 shapely：用底面四角的多边形 IoU
+    #     try:
+    #         from shapely.geometry import Polygon
+    #         print(" shapely bev calcualtion")
+    #     except Exception as e:
+    #         raise RuntimeError(
+    #             "BEV IoU: mmdet3d 内置接口不可用且未安装 shapely。"
+    #             "请 pip install shapely，或修复 mmdet3d 导入。"
+    #         ) from e
+
+    #     def polys_from_boxes(boxes):
+    #         # boxes.corners: [N, 8, 3]；取底面四角并投影到 xy
+    #         c = boxes.corners.detach().cpu().numpy()  # [N,8,3]
+    #         # 常见索引：底面四角可用 [0,1,5,4]（若方向不对可改为 [0,3,7,4]）
+    #         idx = [0, 1, 5, 4]
+    #         polys = []
+    #         for pts in c:
+    #             xy = pts[idx, :2]
+    #             poly = Polygon(xy)
+    #             if not poly.is_valid:
+    #                 poly = poly.buffer(0)
+    #             polys.append(poly)
+    #         return polys
+
+    #     ppolys = polys_from_boxes(pred_boxes)
+    #     gpolys = polys_from_boxes(gt_boxes)
+    #     M = np.zeros((len(ppolys), len(gpolys)), dtype=np.float32)
+    #     for i, pp in enumerate(ppolys):
+    #         for j, gg in enumerate(gpolys):
+    #             inter = pp.intersection(gg).area
+    #             union = pp.union(gg).area
+    #             M[i, j] = 0.0 if union <= 0 else inter / union
+    #     return M
+
+
+def _iou3d_matrix(pred_boxes, gt_boxes):
+    # 用 mmdet3d 的 3D IoU（注意输入是 Instances，不是 7-d numpy）
+    from mmdet3d.core.bbox.iou_calculators.iou3d_calculator import bbox_overlaps_3d
+    # pred_boxes, gt_boxes 都是 LiDARInstance3DBoxes
+    iou = bbox_overlaps_3d(pred_boxes, gt_boxes, coordinate='lidar').cpu().numpy()
+    return iou
+
+
+
+
+
+
+def eval_one_frame(
+    gt_boxes, gt_labels, pred_boxes, pred_labels,
+    match_mode='center',      # 'center' | 'bev_iou' | 'iou3d'
+    thr=2.0,                  # center: meters；IoU: [0,1]
+    classwise=True,
+    return_matches=False      # 是否返回匹配细节，便于诊断
+):
+    # 统一数据
+    pred7 = _to_lidar7(pred_boxes)
+    gt7   = _to_lidar7(gt_boxes)
+    pred_labels = np.asarray(pred_labels).astype(int)
+    gt_labels   = np.asarray(gt_labels).astype(int)
+
+    P, G = len(pred7), len(gt7)
+    if P==0 and G==0:
+        out = dict(tp=0, fp=0, fn=0, precision=0, recall=0, f1=0, mean_score=0)
+        return (out, []) if return_matches else out
+    if G==0:
+        out = dict(tp=0, fp=P, fn=0, precision=0, recall=0, f1=0, mean_score=0)
+        return (out, []) if return_matches else out
+    if P==0:
+        out = dict(tp=0, fp=0, fn=G, precision=0, recall=0, f1=0, mean_score=0)
+        return (out, []) if return_matches else out
+
+    # 选择度量矩阵
+    if match_mode == 'center':
+        M = _center_dist_matrix(pred7, gt7)       # 越小越好
+        better_when_small = True
+    elif match_mode == 'bev_iou':
+        M = _bev_iou_matrix(pred_boxes, gt_boxes) # 越大越好
+        better_when_small = False
+    elif match_mode == 'iou3d':
+        M = _iou3d_matrix(pred7, gt7)   # 越大越好
+        better_when_small = False
+    else:
+        raise ValueError(match_mode)
+
+    # 类别集合（或不分类别）
+    classes = np.union1d(pred_labels, gt_labels) if classwise else [None]
+
+    TP=FP=FN=0
+    scores = []          # 存放“匹配得分”（中心距离或 IoU）
+    match_detail = []    # [(pidx,gidx,score),...]
+
+    for c in classes:
+        if c is None:
+            pidx = np.arange(P); gidx = np.arange(G); C = M
+        else:
+            pidx = np.where(pred_labels==c)[0]; gidx = np.where(gt_labels==c)[0]
+            C = M[np.ix_(pidx, gidx)] if (len(pidx)>0 and len(gidx)>0) else np.zeros((len(pidx), len(gidx)))
+
+        if C.size == 0:
+            TPc, FPc, FNc = 0, len(pidx), len(gidx)
+        else:
+            # 构建代价矩阵
+            if better_when_small:
+                cost = C.copy()                  # 中心距：小为好 → 直接最小化
+            else:
+                cost = 1.0 - C                  # IoU：大为好 → 最小化 (1 - IoU)
+
+            ri, cj = linear_sum_assignment(cost)
+            # 阈值判定
+            if match_mode == 'center':
+                ok = C[ri, cj] <= thr
+                sc = C[ri, cj]
+            else:
+                ok = C[ri, cj] >= thr
+                sc = C[ri, cj]
+
+            TPc = int(ok.sum())
+            FPc = len(pidx) - TPc
+            FNc = len(gidx) - TPc
+
+            # 记录匹配细节（映射回全局索引）
+            for rr, cc, is_ok in zip(ri, cj, ok):
+                if is_ok:
+                    pi = pidx[rr]; gi = gidx[cc]
+                    match_detail.append((int(pi), int(gi), float(sc[ri==rr][0])))
+
+            scores.extend(sc[ok].tolist())
+
+        TP += TPc; FP += FPc; FN += FNc
+
+    prec = 0.0 if (TP+FP)==0 else TP/(TP+FP)
+    rec  = 0.0 if (TP+FN)==0 else TP/(TP+FN)
+    f1   = 0.0 if (prec+rec)==0 else 2*prec*rec/(prec+rec)
+    mean_score = float(np.mean(scores)) if scores else 0.0
+    out = dict(tp=TP, fp=FP, fn=FN, precision=float(prec), recall=float(rec), f1=float(f1),
+               mean_center_dist=mean_score if match_mode=='center' else None,
+               mean_iou=mean_score if match_mode!='center' else None)
+
+    return (out, match_detail) if return_matches else out
+
+
+
+
+
+
+
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+VoI_model = DetectMultiBackend('yolov5s.pt', device=device)
+VoI_model.model.eval()
+
+# define   DRL decision model
+
+
+class Replay_buffer(object):
+    def __init__(self, max_memory_cap):
+        self.storage = []
+        self.max_size = max_memory_cap
+        self.ptr = 0
+
+    def push(self, data):
+        if len(self.storage) == self.max_size:
+            self.storage[int(self.ptr)] = data
+            self.ptr = (self.ptr + 1) % self.max_size
+        else:
+            self.storage.append(data)
+
+    def sample(self, batch_size):
+        index = np.random.randint(0, len(self.storage), size=batch_size)
+        o, a, o_, r = [], [], [], []
+
+        for i in index:
+            obs, action,obs_,Re = self.storage[i]
+            o.append(np.array(obs, copy=False))
+            a.append(np.array(action, copy=False))
+            o_.append(np.array(obs_, copy=False))
+            r.append(np.array(Re, copy=False))
+            # d.append(np.array(D, copy=False))
+
+        return np.array(o), np.array(a), np.array(o_), np.array(r).reshape(-1, 1),
+
+
+
+
+class Actor(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Actor, self).__init__()
+        num_units_1 =128
+        num_units_2 =128
+        # print(type(state_dim),type(args.num_units_1))
+        self.linear_a1 = nn.Linear(state_dim, num_units_1)
+        self.linear_a2 = nn.Linear(num_units_1, num_units_2)
+        self.linear_a = nn.Linear(num_units_2, action_dim)
+        self.reset_parameters()
+        # Activation func init
+        self.LReLU = nn.LeakyReLU(0.01)
+        self.tanh = nn.Tanh()
+        self.train()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.linear_a1.weight, a=0.01)  
+        nn.init.kaiming_uniform_(self.linear_a2.weight, a=0.01)
+        nn.init.uniform_(self.linear_a.weight, -0.003, 0.003)  
+        nn.init.uniform_(self.linear_a.bias, -0.003, 0.003)
+
+    def forward(self, input_state):
+        #print("!!!!!",input_state)
+        x = self.LReLU(self.linear_a1(input_state))
+        #print("x",x)
+        x = self.LReLU(self.linear_a2(x))
+        # print("second layer", x)
+        policy = F.softsign(self.linear_a(x)) 
+        # 
+        # print("policy",policy)
+        # policy = self.tanh(self.linear_a(x))
+        # print("policy", policy)
+        return policy 
+
+
+class Critic(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(Critic, self).__init__()
+        num_units_1 = 128
+        num_units_2 = 128
+        self.linear_c1 = nn.Linear(state_dim + action_dim, num_units_1)
+        self.linear_c2 = nn.Linear(num_units_1 , num_units_2)
+        self.linear_c = nn.Linear(num_units_2, 1)
+        self.reset_parameters()
+        self.LReLU = nn.LeakyReLU(0.01)
+        self.tanh = nn.Tanh()
+        self.train()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.linear_c1.weight, a=0.01)
+        nn.init.kaiming_uniform_(self.linear_c2.weight, a=0.01)
+        nn.init.uniform_(self.linear_c.weight, -0.003, 0.003)
+
+    def forward(self, input_state, input_action):
+        # print(" input state", type(input_state),input_state)
+        # print("input action", type(input_action), input_action)
+        x = self.LReLU(self.linear_c1(torch.cat([input_state, input_action], 1)))
+        x = self.LReLU(self.linear_c2(x))
+        x = self.linear_c(x)
+        return x
+
+
+class DDPG(object):
+    def __init__(self, state_dim, action_dim,memory_size,lr_a,lr_c):
+        self.actor = Actor(state_dim, action_dim).to(device)
+        self.actor_target = Actor(state_dim, action_dim).to(device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_a)
+
+        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic_target = Critic(state_dim, action_dim).to(device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_c)
+        self.replay_buffer = Replay_buffer(memory_size)
+
+        self.num_critic_update_iteration = 0
+        self.num_actor_update_iteration = 0
+        self.num_training = 0
+
+
+    def select_action(self, state):
+        # print("the state", state)
+        # print(type(state))
+        # state = torch.FloatTensor(state.reshape(1, -1)).to(device)
+        state = torch.FloatTensor(np.array(state).reshape(1, -1)).to(device)
+        # print(state)
+        return self.actor(state).cpu().data.numpy().flatten()
+
+    def update(self):
+        update_iteration = 2
+        batch_size = 64
+        gamma= 0.95
+        tau = 0.005
+        for it in range( update_iteration):
+            # Sample replay buffer
+            o, a, o_, r = self.replay_buffer.sample(batch_size)
+            state = torch.FloatTensor(o).to(device)
+            action = torch.FloatTensor(a).to(device)
+            next_state = torch.FloatTensor(o_).to(device)
+            # done = torch.FloatTensor(1-d).to(device)
+            reward = torch.FloatTensor(r).to(device)
+
+            # Compute the target Q value
+            target_Q = self.critic_target(next_state, self.actor_target(next_state))
+            target_Q = reward + (gamma * target_Q).detach()
+
+            # Get current Q estimate
+            # print("state.shape:", state.shape)
+            # print("action.shape:", action.shape)
+            current_Q = self.critic(state, action)
+
+            # Compute critic loss
+            critic_loss = F.mse_loss(current_Q, target_Q)
+            # self.writer.add_scalar('Loss/critic_loss', critic_loss, global_step=self.num_critic_update_iteration)
+            # Optimize the critic
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            # nn.utils.clip_grad_norm_(self.critic.parameters(), args.max_grad_norm)
+            self.critic_optimizer.step()
+
+            # Compute actor loss
+            # print(" this is the actorloss")
+            pred_action = self.actor(state)
+            actor_loss = -self.critic(state, pred_action).mean()
+            # self.writer.add_scalar('Loss/actor_loss', actor_loss, global_step=self.num_actor_update_iteration)
+            reg_term = (pred_action ** 2).mean()  # 正则限制动作不要太大
+            actor_loss += 1e-2 * reg_term
+            # Optimize the actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            # Update the frozen target models
+            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+            self.num_actor_update_iteration += 1
+            self.num_critic_update_iteration += 1
+
+
+    def save(self, save_dir, episode=None, step=None, tag=None):
+        os.makedirs(save_dir, exist_ok=True)
+
+        # 构建文件名
+        filename = "actor"
+        if episode is not None:
+            filename += f"_ep{episode}"
+        if step is not None:
+            filename += f"_step{step}"
+        if tag is not None:
+            filename += f"_{tag}"
+        filename += ".pth"
+
+        # 保存 actor
+        torch.save(self.actor.state_dict(), os.path.join(save_dir, filename))
+
+        # 保存 critic
+        critic_filename = filename.replace("actor", "critic")
+        torch.save(self.critic.state_dict(), os.path.join(save_dir, critic_filename))
+
+        print(f"[INFO] Saved model to {save_dir} ({filename})")
+
+    def load(self, actor_path, critic_path, device=None):
+        map_loc = device if device is not None else "cpu"
+        self.actor.load_state_dict(torch.load(actor_path, map_location=map_loc))
+        self.critic.load_state_dict(torch.load(critic_path, map_location=map_loc))
+        self.actor.to(device) if device is not None else None
+        self.critic.to(device) if device is not None else None
+        self.actor.eval()
+        self.critic.eval()
+        print(f"[INFO] Loaded model: {actor_path}, {critic_path}")
+
+###############################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+IoU_threshold =  0.5
+Intersection_Range = 200  # m  
+Timeslot = 0.1 #  s
+# define simulation entity
+class Vehicle(object):
+    def __init__(self,loc, direction,):
+        self.loc = loc # [x,y,0]
+        self.direction = direction 
+        self.speed =  10  # 10 m/s
+        self.power_trans = 23  # dbm
+        self.power_computing =   20 # w
+        self.data_featue_size = 131072  # 1X 64 X 64 X 4 X 8 =  128 KB
+        self.raw_data_size = 27344896 # 3.26MB 
+
+    def move_model(self, delta_t = 0.1):
+        if self.direction == 0:
+            self.loc[1] -= self.speed * delta_t
+        elif self.direction == 1:
+          self.loc[1] += self.speed * delta_t
+        elif self.direction == 2:
+           self.loc[0] += self.speed * delta_t
+        else:
+          self.loc[0]-= self.speed * delta_t
+    
+class RSU (object):
+    def __init__(self):
+        self.loc = np.array([0.0,0.0,4.5]) # m 
+        self.power_trans = 30  # dbm
+        self.power_computing =   150 # w
+
+# set 
+def generate_vehicle_positions( max_distance=Intersection_Range , lane_width=3.5):
+ 
+    
+    direction = np.random.choice([0, 1, 2, 3])
+    lane_offset = lane_width / 2 + np.random.choice([0, lane_width])
+    
+    if direction == 0:  
+        x = np.random.uniform(-lane_offset, lane_offset)
+        y = np.random.uniform(0, max_distance)
+    elif direction == 1: 
+        x = np.random.uniform(-lane_offset, lane_offset)
+        y = np.random.uniform(-max_distance, 0)
+    elif direction == 2:  
+        x = np.random.uniform(-max_distance, 0)
+        y = np.random.uniform(-lane_offset, lane_offset)
+    else: 
+        x = np.random.uniform(0, max_distance)
+        y = np.random.uniform(-lane_offset, lane_offset)
+
+
+    return np.array([x,y,.0]), direction 
+
+
+
+# communication part:
+# channel model: markov channel with five states
+class MarkovChannelFiveState:
+    def __init__(self):
+        self.states = [1, 2, 3, 4, 5] # from worse to best 
+        self.scaling = {
+            1: 0.2,
+            2: 0.4,
+            3: 0.6,
+            4: 0.8,
+            5: 1.0
+        }
+        self.current_state = 4  # we start with the state 4 
+
+        self.P =  np.array([
+            [0.7, 0.2, 0.1, 0.0, 0.0],
+            [0.1, 0.6, 0.2, 0.1, 0.0],
+            [0.0, 0.1, 0.6, 0.2, 0.1],
+            [0.0, 0.0, 0.1, 0.6, 0.3],
+            [0.0, 0.0, 0.1, 0.2, 0.7],
+        ])
+
+    def step(self):
+        #   if they do not transmit they also update channel 
+        state_index = self.current_state - 1
+        next_state = np.random.choice(self.states, p=self.P[state_index])
+        self.current_state = next_state
+
+    def step_with_rate(self, rate):
+        #  they choose to transmit , they upday the channel state and get the rate 
+        state_index = self.current_state - 1
+        next_state = np.random.choice(self.states, p=self.P[state_index])
+        self.current_state = next_state
+        # print("self.scaling[next_state]",self.scaling[next_state])
+        adjusted_rate = rate * float(self.scaling[next_state])
+        # print("adjusted_rate", adjusted_rate)
+        return adjusted_rate
+
+
+def get_rate(distance, P_tx_dBm):
+    # input distance between tx and rx  (m)
+    # output rate (bp/s)
+    # only large scale path loss 
+    f_c = 5.9e9  # 5.9 GHz
+    c = 3e8  
+    lambda_c = c / f_c
+    bandwidth_Hz = 5e6  # 5 MHz 
+    P_tx_dBm = P_tx_dBm  # 
+    G_tx = 3  # G-TX dbi
+    G_rx =  3  # G-Rx dBi 
+    noise_figure_dB = 7  # noise
+    path_loss_exponent = 2.8  #  pathloss factor
+    shadow_fading_sigma = 3  # shadow（dB）
+    # large scale  pathloss
+    PL0 = 20 * np.log10(4 * np.pi / lambda_c)  # 1 m freespace path-loss
+    path_loss_dB = PL0 + 10 * path_loss_exponent * np.log10(distance) \
+                  + np.random.normal(0, shadow_fading_sigma)
+    # path_loss_dB = PL0 + 10 * path_loss_exponent * np.log10(distance) 
+               
+    # simal scale  Raleigh fading
+    # rayleigh_fading_linear = np.random.rayleigh(scale=1.0) ** 2  # mean =1, Rayleigh channel gain power
+    # rayleigh_fading_dB = 10 * np.log10(rayleigh_fading_linear)
+    # P_rx_dBm = P_tx_dBm + G_tx + G_rx - path_loss_dB +  rayleigh_fading_dB
+    P_rx_dBm = P_tx_dBm + G_tx + G_rx - path_loss_dB 
+    kT_dBm_per_Hz = -174  # dBm/Hz
+    noise_power_dBm = kT_dBm_per_Hz + 10 * np.log10(bandwidth_Hz) + noise_figure_dB
+
+    # SNR（dB)
+    snr_dB = P_rx_dBm - noise_power_dBm
+    snr_linear = 10 ** (snr_dB / 10)
+    capacity_bps = bandwidth_Hz * np.log2(1 + snr_linear)
+    capacity_mbps = capacity_bps   #  bps 
+
+
+    return max(capacity_mbps, 0) 
+
+def get_rate_snr(snr_dB):
+
+    bandwidth_Hz = 5e6  # 5 MHz 
+    snr_linear = 10 ** (snr_dB / 10)
+    capacity_bps = bandwidth_Hz * np.log2(1 + snr_linear)
+    capacity_mbps = capacity_bps   #  bps 
+
+
+    return max(capacity_mbps, 0) 
+
+def get_snr(distance, P_tx_dBm):
+
+    # 基本参数
+    f_c = 5.9e9
+    c = 3e8
+    lam = c / f_c
+    B_Hz = 5e6               # 带宽
+    G_tx_dBi, G_rx_dBi = 2.0, 2.0
+    NF_dB = 7.0
+    impl_margin_dB = 3.0     # 实现/安装等损耗
+
+    # 城市十字路口（UMi）LOS/NLOS 参数（可按需微调）
+    n_LOS,  n_NLOS  = 2.2, 3.6       # 路损指数
+    I_LOS_dBm, I_NLOS_dBm = -96.0, -92.0   # 固定干扰功率（LOS 略好、NLOS 略差）
+
+    # 1) 距离与 P_LOS(d)
+    d = max(float(distance), 1.0)
+    # 3GPP UMi: P_LOS(d) = min(18/d,1)*(1-exp(-d/36)) + exp(-d/36)
+    p_los = min(18.0/d, 1.0) * (1 - np.exp(-d/36.0)) + np.exp(-d/36.0)
+
+    # 2) 路径损耗（LOS/NLOS）
+    PL0_dB = 20 * np.log10(4 * np.pi / lam)
+    PL_LOS_dB  = PL0_dB + 10 * n_LOS  * np.log10(d)
+    PL_NLOS_dB = PL0_dB + 10 * n_NLOS * np.log10(d)
+
+    # 3) 接收功率（dBm -> 线性功率加权期望，再回到 SINR）
+    P_rx_LOS_dBm  = P_tx_dBm + G_tx_dBi + G_rx_dBi - PL_LOS_dB  - impl_margin_dB
+    P_rx_NLOS_dBm = P_tx_dBm + G_tx_dBi + G_rx_dBi - PL_NLOS_dB - impl_margin_dB
+
+    P_rx_LOS_lin  = 10**(P_rx_LOS_dBm/10)
+    P_rx_NLOS_lin = 10**(P_rx_NLOS_dBm/10)
+    # 期望混合（线性域）
+    P_rx_lin = p_los * P_rx_LOS_lin + (1 - p_los) * P_rx_NLOS_lin
+
+    # 4) 噪声 + 干扰（同样用期望混合）
+    N_dBm = -174 + 10*np.log10(B_Hz) + NF_dB
+    N_lin  = 10**(N_dBm/10)
+    I_lin  = p_los * 10**(I_LOS_dBm/10) + (1 - p_los) * 10**(I_NLOS_dBm/10)
+    NI_lin = N_lin + I_lin
+
+    # 5) SINR（dB），并裁剪到 0~30 dB
+    sinr_lin = P_rx_lin / NI_lin
+    sinr_dB  = 10 * np.log10(max(sinr_lin, 1e-12))
+    sinr_dB  = float(np.clip(sinr_dB, 0.0, 30.0))
+
+    return sinr_dB
+    
+
+
+# def get_snr(distance, P_tx_dBm):
+#     # input distance between tx and rx  (m)
+#     # output rate (bp/s)
+#     # only large scale path loss 
+#     f_c = 5.9e9  # 5.9 GHz
+#     c = 3e8  
+#     lambda_c = c / f_c
+#     bandwidth_Hz = 5e6  # 5 MHz 
+#     P_tx_dBm = P_tx_dBm  # 
+#     G_tx = 3  # G-TX dbi
+#     G_rx =  3  # G-Rx dBi 
+#     noise_figure_dB = 7  # noise
+#     path_loss_exponent = 2.8  #  pathloss factor
+#     shadow_fading_sigma = 3  # shadow（dB）
+#     # large scale  pathloss
+#     PL0 = 20 * np.log10(4 * np.pi / lambda_c)  # 1 m freespace path-loss
+#     path_loss_dB = PL0 + 10 * path_loss_exponent * np.log10(distance) \
+#                    + np.random.normal(0, shadow_fading_sigma)
+#     # path_loss_dB = PL0 + 10 * path_loss_exponent * np.log10(distance) 
+               
+#     # simal scale  Raleigh fading
+#     # rayleigh_fading_linear = np.random.rayleigh(scale=1.0) ** 2  # mean =1, Rayleigh channel gain power
+#     # rayleigh_fading_dB = 10 * np.log10(rayleigh_fading_linear)
+#     # print("rayleigh_fading_dB", rayleigh_fading_dB)
+#    #  P_rx_dBm = P_tx_dBm + G_tx + G_rx - path_loss_dB +  rayleigh_fading_dB
+#     P_rx_dBm = P_tx_dBm + G_tx + G_rx - path_loss_dB 
+#     kT_dBm_per_Hz = -174  # dBm/Hz
+#     noise_power_dBm = kT_dBm_per_Hz + 10 * np.log10(bandwidth_Hz) + noise_figure_dB
+
+#     # SNR（dB)
+#     snr_dB = P_rx_dBm - noise_power_dBm
+#     snr_linear = 10 ** (snr_dB / 10)
+#     capacity_bps = bandwidth_Hz * np.log2(1 + snr_linear)
+#     capacity_mbps = capacity_bps   #  bps 
+
+
+#     return snr_dB
+
+
+
+
+vehicle_computing_power = 20 # w
+# calculate VOI temporal change and object importance
+target_classes = ['person', 'bicycle', 'car','bus','motorcycle','truck']
+important_weights = {'person': 1.0, 'bicycle': 1.0, 'car': 1, 'bus':1,'motorcycle':1,'truck':1}
+coco_classnames = VoI_model.names
+
+
+  
+def yolo_inference(img0):
+    img = cv2.cvtColor(img0, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (640, 640))  
+    img = img.transpose((2, 0, 1))  # HWC → CHW
+    img = np.ascontiguousarray(img) 
+    img = torch.from_numpy(img.copy()).to(device).float() / 255.0
+    img = img.unsqueeze(0) 
+    pred = VoI_model(img, augment=False, visualize=False)
+    pred = non_max_suppression(pred, conf_thres=0.25, iou_thres=0.45)[0]
+  
+    # [{class: str, bbox: [x1,y1,x2,y2]}]
+    detections = []
+    if pred is not None and len(pred):
+        pred[:, :4] = scale_coords(img.shape[2:], pred[:, :4], img0.shape).round()
+        for *xyxy, conf, cls_id in pred:
+            cls_id = int(cls_id.item())
+            cls_name = coco_classnames[cls_id]
+            if cls_name not in target_classes:
+                continue
+            bbox = [float(x.item()) for x in xyxy]
+            detections.append({"class": cls_name, "bbox": bbox})
+    return detections
+
+
+def yolo_inference_all(img0):
+    important_weights = {
+        'person': 1.0, 'bicycle': 1.0, 'car': 1.0,
+        'bus': 1.0, 'motorcycle': 1.0, 'truck': 1.0
+    }
+
+    img = cv2.cvtColor(img0, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (640, 640))  
+    img = img.transpose((2, 0, 1))  
+    img = np.ascontiguousarray(img) 
+    img = torch.from_numpy(img.copy()).to(device).float() / 255.0
+    img = img.unsqueeze(0) 
+
+    pred = VoI_model(img, augment=False, visualize=False)
+    pred = non_max_suppression(pred, conf_thres=0.25, iou_thres=0.45)[0]
+
+    detections = []
+    class_counts = {}
+    total_importance = 0.0
+    per_object_scores = []
+
+    if pred is not None and len(pred):
+        pred[:, :4] = scale_coords(img.shape[2:], pred[:, :4], img0.shape).round()
+        for *xyxy, conf, cls_id in pred:
+            cls_id = int(cls_id.item())
+            cls_name = coco_classnames[cls_id]
+            if cls_name not in target_classes:
+                continue
+
+            bbox = [float(x.item()) for x in xyxy]
+            conf_score = float(conf.item())
+
+            # 计算当前目标的重要性
+            weight = important_weights.get(cls_name, 1.0)
+            importance = weight * conf_score
+            total_importance += importance
+            per_object_scores.append(importance)
+
+            detections.append({
+                "class": cls_name,
+                "bbox": bbox,
+                "conf": conf_score
+            })
+            class_counts[cls_name] = class_counts.get(cls_name, 0) + 1
+
+    result = {
+        "detections": detections,
+        "num_objects": len(detections),
+        "class_counts": class_counts,
+        "avg_confidence": np.mean([d["conf"] for d in detections]) if detections else 0.0,
+        "total_importance": total_importance,
+    }
+
+    return result
+
+
+
+def save_all_results_to_one_file(all_results, save_path):
+
+    save_dir = os.path.dirname(save_path)
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+        
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(all_results, f, indent=4)
+
+
+def calculate_iou(box1, box2):
+    x1, y1, x2, y2 = box1
+    x1g, y1g, x2g, y2g = box2
+
+    xi1, yi1 = max(x1, x1g), max(y1, y1g)
+    xi2, yi2 = min(x2, x2g), min(y2, y2g)
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+
+    box1_area = (x2 - x1) * (y2 - y1)
+    box2_area = (x2g - x1g) * (y2g - y1g)
+
+    union_area = box1_area + box2_area - inter_area
+    if union_area == 0:
+        return 0.0
+    return inter_area / union_area
+
+
+# calculate- semantic value function 
+def calculate_image_VOI_semantic(target_classes, important_weights,
+                                  current_detections, previous_detections, iou_threshold=0.5):
+    value_score = 0
+    count = 0
+    for cur in current_detections:
+        cls = cur["class"]
+        if cls not in target_classes:
+            continue
+        weight = important_weights.get(cls, 1.0)
+        cur_bbox = cur["bbox"]
+        best_iou = 0
+        for prev in previous_detections:
+            if prev["class"] == cls:
+                iou = calculate_iou(cur_bbox, prev["bbox"])
+                best_iou = max(best_iou, iou)
+        iou_diff = 1 - best_iou
+        if best_iou < iou_threshold:
+            # this is a new object
+            value_score += weight * 1
+        else:
+            value_score += weight * iou_diff
+        count = count + 1
+    
+    if count ==0:
+        value_score = 0
+    else:
+        value_score = value_score/5
+    # nomarlization make the value into [0,1]  1 means more important  
+    # value_score = value_score 
+    return value_score
+
+# calculate AoI
+# max_wait means surpass 0.5s we need to uplod agagin ( its too old)
+def calculate_aoi_value(current_timestamp, last_upload_timestamp, max_wait=0.5):
+    age = current_timestamp - last_upload_timestamp
+    # print("age",age)
+    # if age >100:
+    #     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    normalized_age = min(age / max_wait, 1.0)  # 归一化到 [0, 1]
+    return normalized_age
+
+
+def calculate_image_total_VOI(
+    target_classes, important_weights,
+    current_detections, previous_detections,
+    current_timestamp, last_upload_timestamp,
+    iou_threshold=0.5,
+    alpha_semantic=0.7,
+    alpha_aoi=0.3):
+
+    semantic_value = calculate_image_VOI_semantic(
+        target_classes,
+        important_weights,
+        current_detections,
+        previous_detections,
+        iou_threshold
+    )
+    # print("semantic value:", semantic_value)
+    # 2. AoI 
+    aoi_value = calculate_aoi_value(current_timestamp, last_upload_timestamp)
+    # print("age of information", aoi_value)
+    total_value = alpha_semantic * semantic_value + alpha_aoi * aoi_value
+    return total_value
+
+def calculate_semantic_voi_2(
+    current_detections, 
+    previous_detections, 
+    target_classes, 
+    important_weights=None, 
+    iou_threshold=0.5, 
+    alpha=0.2, 
+    beta=0.8
+):
+
+    if important_weights is None:
+        important_weights = {cls: 1.0 for cls in target_classes}
+
+    static_importance = 0
+    semantic_change = 0
+    valid_count = 0
+
+    for cur in current_detections:
+        cls = cur["class"]
+        if cls not in target_classes:
+            continue
+        weight = important_weights.get(cls, 1.0)
+        cur_bbox = cur["bbox"]
+
+        static_importance += weight
+        valid_count += 1
+
+    
+        best_iou = 0
+        for prev in previous_detections:
+            if prev["class"] == cls:
+                iou = calculate_iou(cur_bbox, prev["bbox"])
+                best_iou = max(best_iou, iou)
+
+        iou_diff = 1 - best_iou 
+
+        if best_iou < iou_threshold:
+    
+            semantic_change += weight * 2
+        else:
+            semantic_change += weight * iou_diff
+
+
+    if valid_count > 0:
+        static_importance /= valid_count
+        semantic_change /= valid_count
+    else:
+        static_importance = 0
+        semantic_change = 0
+
+    voi_score = alpha * static_importance + beta * semantic_change
+
+    return voi_score
+def calculate_semantic_voi_3(
+    current_detections, 
+    previous_detections, 
+    target_classes, 
+    important_weights=None, 
+    iou_threshold=0.5, 
+    alpha=0.2, 
+    beta=0.6, 
+    gamma=0.2, 
+):
+    if important_weights is None:
+        important_weights = {cls: 1.0 for cls in target_classes}
+
+    static_importance = 0
+    semantic_change = 0
+    loss_penalty = 0
+    valid_count = 0
+
+    matched_prev_indices = set()
+
+
+    for cur in current_detections:
+        cls = cur["class"]
+        if cls not in target_classes:
+            continue
+        weight = important_weights.get(cls, 1.0)
+        cur_bbox = cur["bbox"]
+
+        static_importance += weight
+        valid_count += 1
+
+        best_iou = 0
+        best_match_idx = -1
+        for idx, prev in enumerate(previous_detections):
+            if prev["class"] == cls:
+                iou = calculate_iou(cur_bbox, prev["bbox"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_match_idx = idx
+
+        iou_diff = 1 - best_iou
+        if best_iou < iou_threshold:
+            semantic_change += weight * 2
+        else:
+            semantic_change += weight * iou_diff
+            matched_prev_indices.add(best_match_idx)
+
+
+    for idx, prev in enumerate(previous_detections):
+        if prev["class"] not in target_classes:
+            continue
+        if idx not in matched_prev_indices:
+            weight = important_weights.get(prev["class"], 1.0)
+            loss_penalty += weight * 1.5  
+
+
+    if valid_count > 0:
+        static_importance /= valid_count
+        semantic_change /= valid_count
+    else:
+        static_importance = 0
+        semantic_change = 0
+
+
+    voi_score = alpha * static_importance + beta * semantic_change + gamma * loss_penalty
+
+    return voi_score
+
+def generate_random_upload_decision(prob: float = 0.5):
+    return {
+        "vehicle_img": int(random.random() < prob),
+        "vehicle_points": int(random.random() < prob),
+        # "infrastructure_img": [int(random.random() < prob) for _ in range(3)],
+        # "infrastructure_points": int(random.random() < prob)
+    }
+
+
+def apply_upload_decision(data, last_valid_data, upload_decision):
+    # Vehicle image (whole)
+    if upload_decision == 0:
+        data["vehicle_img"] = last_valid_data["vehicle_img"]
+        data["vehicle_points"] = last_valid_data["vehicle_points"]
+    else:
+        last_valid_data["vehicle_img"] = data["vehicle_img"]
+        last_valid_data["vehicle_points"] = data["vehicle_points"]
+    return data, last_valid_data
+
+
+def evaluate_single_frame(gt_bboxes, gt_labels, pred_bboxes, pred_labels, scores=None, iou_thresh=0.5):
+
+    # 计算 IoU 矩阵 (pred x gt)
+    ious = bbox_overlaps_3d(pred_bboxes, gt_bboxes).cpu().numpy()
+
+    matched_gt = set()
+    tp = 0
+    fp = 0
+    correct_cls = 0
+    iou_list = []
+
+    for i, pred_box in enumerate(pred_bboxes):
+        pred_label = pred_labels[i]
+        iou_row = ious[i]
+        max_iou_idx = np.argmax(iou_row)
+        max_iou = iou_row[max_iou_idx]
+
+        if max_iou >= iou_thresh and max_iou_idx not in matched_gt:
+            matched_gt.add(max_iou_idx)
+            tp += 1
+            iou_list.append(max_iou)
+            if pred_label == gt_labels[max_iou_idx]:
+                correct_cls += 1
+        else:
+            fp += 1
+
+    fn = len(gt_bboxes) - len(matched_gt)
+
+    precision = tp / (tp + fp + 1e-6)
+    recall = tp / (tp + fn + 1e-6)
+    mean_iou = np.mean(iou_list) if iou_list else 0.0
+    cls_accuracy = correct_cls / tp if tp > 0 else 0.0
+    
+
+    # return {
+    #     "TP": tp,
+    #     "FP": fp,
+    #     "FN": fn,
+    #     "Precision": precision,
+    #     "Recall": recall,
+    #     "Mean IoU": mean_iou,
+    #     "Class Accuracy": cls_accuracy
+    # }
+    return recall, mean_iou
+
+
+
+
+
+
+
+def recursive_eval(obj, globals=None):
+    if globals is None:
+        globals = copy.deepcopy(obj)
+
+    if isinstance(obj, dict):
+        for key in obj:
+            obj[key] = recursive_eval(obj[key], globals)
+    elif isinstance(obj, list):
+        for k, val in enumerate(obj):
+            obj[k] = recursive_eval(val, globals)
+    elif isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
+        obj = eval(obj[2:-1], globals)
+        obj = recursive_eval(obj, globals)
+
+    return obj
+
+def measure_inference_energy(image, device_power_watt=vehicle_computing_power):
+    start_time = time.time()
+    current_detections = yolo_inference(image)  
+    end_time = time.time()
+    
+    inference_time = end_time - start_time
+    estimated_energy = device_power_watt * inference_time  # J
+    print(f"Inference time: {inference_time:.4f} s")
+    print(f"Estimated energy consumption: {estimated_energy:.4f} J")
+    
+    return current_detections, inference_time, estimated_energy
+
+def load_json_filepaths_sorted(folder_path):
+    return sorted([
+        os.path.join(folder_path, f)
+        for f in os.listdir(folder_path)
+        if f.endswith('.json')
+    ])
+
+CLASS_NAME_TO_ID = {
+    "CAR": 0,
+    "TRAILER": 1,
+    "TRUCK": 2,
+    "VAN": 3,
+    "PEDESTRIAN": 4,
+    "BUS": 5,
+    "BICYCLE": 6
+}
+
+class SemanticDriftTracker:
+    def __init__(self, window_size=3):
+        self.window_size = window_size
+        self.buffer = deque(maxlen=window_size)
+
+    def update(self, voi_value):
+        self.buffer.append(voi_value)
+
+    def drift(self):
+    
+        if len(self.buffer) < 2:
+            return 0.0  
+
+        drift_sum = 0.0
+        for i in range(len(self.buffer) - 1):
+            drift_sum += abs(self.buffer[i + 1] - self.buffer[i])
+        return drift_sum
+
+
+
+
+def main() -> None: 
+    seed = 17
+    np.random.seed(seed )
+    random.seed(seed )
+    torch.manual_seed(seed)  
+    torch.cuda.manual_seed(seed)
+    v_loc, v_d = generate_vehicle_positions(max_distance=Intersection_Range)
+    vehicle = Vehicle(loc= v_loc, direction= v_d)
+    rsu = RSU()
+    state_dim = 4 # importance,  change, aoi, action(upload or not)
+    action_dim = 1 # (1: upload, 0: no  )
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    agent_ddpg = DDPG(state_dim, action_dim,memory_size=8000,lr_a=0.0005,lr_c= 0.001)
+    actor_path  = "/home/coopdet3d/RL-model-scmch/actor_ep5_step300.pth"
+    critic_path = "/home/coopdet3d/RL-model-scmch/critic_ep5_step300.pth"
+
+    # actor_path  = "/home/coopdet3d/RL-model-VoI2-alpha6/actor_ep5_step300.pth"
+    # critic_path = "/home/coopdet3d/RL-model-VoI2-alpha6/critic_ep5_step300.pth"
+   
+    agent_ddpg.load(actor_path, critic_path, device=device)
+    agent_ddpg.actor.eval()
+
+    sc_drift_tracker = SemanticDriftTracker(window_size=3)
+    im_drift_tracker = SemanticDriftTracker(window_size=3)
+
+   
+   
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("config", metavar="FILE")
+    parser.add_argument("--mode", type=str, default="gt", choices=["gt", "pred", "combo"])
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
+    parser.add_argument("--bbox-classes", nargs="+", type=int, default=None)
+    parser.add_argument("--bbox-score", type=float, default=0)
+    parser.add_argument("--map-score", type=float, default=0.5)
+    parser.add_argument("--out-dir", type=str, default="viz")
+    parser.add_argument("--save_dir", type=str, default="./RL-model-VoI4-full/",
+                    help="Directory to save models")
+
+    args, opts = parser.parse_known_args()
+
+    configs.load(args.config, recursive=True)
+    configs.update(opts)
+
+    cfg = Config(recursive_eval(configs), filename=args.config)
+
+    torch.backends.cudnn.benchmark = cfg.cudnn_benchmark
+    torch.cuda.set_device(0)
+
+    # build the dataloader
+    dataset = build_dataset(cfg.data[args.split])
+
+    # print("dataset class", dataset.CLASSES)
+
+    dataflow = build_dataloader(
+        dataset,
+        samples_per_gpu=1,
+        workers_per_gpu=cfg.data.workers_per_gpu,
+        dist=False,
+        shuffle=False,
+    )
+
+    # build the model and load checkpoint
+    if args.mode == "pred" or args.mode == "combo":
+        model = build_coop_model(cfg.model)
+        load_checkpoint(model, args.checkpoint, map_location="cpu")
+
+        model = model.cuda()
+        model.eval()
+    # assumption the first step should up load all the information 
+    # now we have 5 five i-data there image view and two lidar cloud point 
+    # two vehicle imforation  one image and one lidar
+
+    ep_step = 8
+    channel_model= MarkovChannelFiveState()
+    
+    VoI = []
+    Accuracy = []
+    current_detections = []
+    current_timestamp = 0
+    previous_detections = None
+    History_sc_change = []
+    decision = -1
+    Decision = []
+    s_aoi= 0
+    previous_timestamp = 0
+    Reward = []
+    EP_reward = []
+    Action = []
+    E2E_energy = []
+    E2E_raw_energy = []
+    E2E_mini_energy = []
+  
+ 
+
+    state = []
+    next_state = []
+    total_reward = 0
+    Loss = []
+    Epsilon = []
+    Vehicle_comp_value = 1  # compare to the communication power consumpution 
+    RSU_comp_value = 1
+    Vehicle_commu_value = 1
+    Rsu_commu_value = 1
+    Accuracy_theshold = 0.90
+    Acception_accuracy = 0.04
+    Valid_data_threshold = 0.86
+    VoI_comp_energy = []
+    V_feature_comp_energy = []
+    VoI_comp_delay = []
+    V_feature_delay = []
+    I_comp_energy = []
+    I_comp_delay = []
+    Raw_I_comp_energy = []
+    Raw_I_comp_delay = []
+    V_raw_comm_delay = []
+    V_raw_comm_energy = []
+    V_feature_comm_energy = []
+    V_feature_comm_delay = []
+    step = 0 
+    done = False
+    # constraint_violations = []
+    # prapare the infrastructure ddata 
+    with open( '/home/coopdet3d/Reward-infras.txt', 'r', encoding='utf-8') as f:
+             Accuracy_infra = [float(line.strip()) for line in f if line.strip()]
+
+    with open( '/home/coopdet3d/Reward-full-1.txt', 'r', encoding='utf-8') as f:
+             Accuracy_full = [float(line.strip()) for line in f if line.strip()]
+    # print(len(Accuracy_infra),type(Accuracy_infra))
+    MAX_EPISODE = 1
+    for j in range (MAX_EPISODE):
+        vehicle.loc, vehicle.direction = generate_vehicle_positions(max_distance=Intersection_Range) 
+        acc_30 = 0.0
+        r_star_30 = 0.25
+        r_star_50 = 0.25
+        bucket = 0.0
+        capacity1 = 9
+        for i, data in enumerate(dataflow):
+          
+            metas = data["metas"].data[0][0]
+            data = scatter(data, [torch.cuda.current_device()])[0] 
+            ### calculate the voi 
+            image_path = metas["vehicle_filename"][0]  #  list
+            # print("image_path",image_path)
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"Warning: Image not found at {image_path}")
+                continue
+            
+            start_time = time.time()
+            # frame_key = f"frame_{i:05d}"
+            current_detections_all = yolo_inference_all(image)
+            end_time = time.time()
+
+
+            v_comp_delay = end_time - start_time
+            # print("vehicle computing delay", v_comp_delay)
+            # only for dectect part  0.2
+            vehicle_voi_comp_delay = v_comp_delay * 0.2
+            vehicle_voi_comp_energy = vehicle.power_computing * (vehicle_voi_comp_delay) 
+            # print(f"vehicle_voi_comp_delay: {vehicle_voi_comp_delay:.4f} s")
+            # print(f"vehicle_voi_comp_energy: {vehicle_voi_comp_energy:.4f} J")
+            VoI_comp_energy.append(vehicle_voi_comp_energy)
+            VoI_comp_delay.append(vehicle_voi_comp_delay)
+            
+
+            current_detections = current_detections_all["detections"]
+            current_imporatnce = current_detections_all["total_importance"]
+            current_detect_number = current_detections_all["num_objects"]
+            # print("step ", i, "detection",current_detections_all["avg_confidence"])
+            # print(current_imporatnce, current_detect_number)
+
+            # state define 
+            s_importance =  current_imporatnce/ current_detect_number
+            if previous_detections is None:
+                s_change = 1 
+            else: 
+                s_change =  calculate_image_VOI_semantic(  target_classes,
+                                                                                important_weights,
+                                                                                current_detections,
+            
+            
+                                                                                previous_detections) 
+            ## leverage the history information 
+            
+            # culculate the communication part 
+            # step the environment with action
+            distance  = np.linalg.norm(vehicle.loc - rsu.loc)
+            print("distance ", distance)
+            channel_snr = get_snr(distance,vehicle.power_trans)
+            # channel_snr =  random.uniform(0, 5)
+            print(" channel_snr", channel_snr)
+            capacity = get_rate_snr(channel_snr)
+            # print(" pathloss-based capacity  (mbps)", capacity/1000000)
+            state_channal = channel_snr/50
+            
+            sc_drift_tracker.update(s_change)
+            sc_current_drift = sc_drift_tracker.drift()
+    
+            sc_state_drift = sc_current_drift
+            # print("?????????????????????sc_state_drift ",sc_state_drift)
+
+
+            # im_drift_tracker.update(s_importance)
+            # im_current_drift = im_drift_tracker.drift()
+    
+            # im_state_drift = im_current_drift
+            # # print("?????????????????????im_state_drift ",im_state_drift)
+
+
+
+
+            if i == 0 :
+                s_aoi = 0 
+                last_data = copy.deepcopy(data)
+    
+            if i == 0:
+                # state = [s_importance,s_change,s_aoi,decision, state_channal]
+                # state = [s_importance,s_change,s_aoi/3,decision,sc_state_drift,state_channal]
+                # state = [s_aoi/3,decision]
+                # scmch ：
+                state = [s_change,sc_state_drift,decision,state_channal]
+                # sc [s_change,decision]
+                # aoi
+
+            else:
+                # next_state = [s_importance,s_change,s_aoi,decision, state_channal ]
+                # next_state = [s_importance,s_change,s_aoi/3,decision,sc_state_drift,state_channal]
+                # next_state  = [s_aoi/3,decision]
+                # #   
+                next_state= [s_change,sc_state_drift,decision,state_channal]
+                # agent_ddpg.replay_buffer.push((state, action,next_state, reward ))
+                state = next_state 
+            
+            print("step",i,"state", state)
+            ### action chose 
+    
+    
+            # 循环内
+            # acc_30 += r_star_30
+            # # # 让上传发生在 AoI 足够大的时刻，这里设为不短于间隔=3 → s_aoi>=2
+            # if acc_30 >= 1.0 and s_aoi >= 1:
+            #     action = np.array([1])
+            #     acc_30 -= 1.0
+            # else:
+            #     action = np.array([-1])
+            # bucket = min(capacity1, bucket + r_star_50)
+
+            # # 令牌>=1 且（给一点随机性），就发；允许 d=1
+            # if bucket >= 1.0 and (np.random.rand() < 0.90) and s_aoi >= 0:
+            #     action = np.array([1])
+            #     bucket -= 1.0
+            # else:
+            #     action = np.array([-1])
+
+         
+            # if np.random.rand() < 0.70:   # 25% 概率上传
+            #     action = np.array([1])
+            # else:
+            #     action = np.array([-1])
+
+            # if s_change > 0.5:
+            #     action =  np.array([1])
+            # else: 
+            #     action =  np.array([-1])
+
+            # if s_aoi==1:
+            #     action =  np.array([1])
+            # else: 
+            #     action =  np.array([-1])
+                  
+            # if i % ep_step == 0:
+            #     action =  np.array([1])
+            #     # upload
+            # else:
+            action = agent_ddpg.select_action(state)
+            print(" agent chose action ", action[0])
+            # # action =  np.array([1])
+    
+
+
+
+
+            if action < 0:
+                decision = -1
+                # don't upload use the previouse data 
+                print("not upload")
+                data = last_data
+            else:
+                print(" upload")
+                decision = 1
+                # print(" last_data", last_data["metas"][0]['timestamp'])
+                last_data = data 
+                # print("current_data",data["metas"][0]['timestamp'])
+            
+           
+        
+            uplink_rate = capacity
+            # print("uplink_rate(bps)",uplink_rate/1000000)
+            sem_trans_delay = (vehicle.data_featue_size* 8)/uplink_rate
+            raw_trans_delay = vehicle.raw_data_size/uplink_rate
+            power_trans = 10 ** (vehicle.power_trans / 10) / 1000
+            sem_trans_energy = sem_trans_delay * power_trans 
+            raw_trans_energy = raw_trans_delay * power_trans
+            # print(f"tansmission delay: {sem_trans_delay:.4f} s")
+            # print(f"v_trans_energy: {sem_trans_energy:.4f} J")
+
+            # print(f"raw data tansmission delay:", raw_trans_delay ,"s")
+            # print(f"raw_trans_energy: ",raw_trans_energy," J")
+       
+
+
+            # culculate the ennrgy consumpution 
+            start_time = time.time()
+            with torch.inference_mode():
+                outputs = model(**data)
+                bboxes = outputs[0]["boxes_3d"].tensor.numpy()
+                scores = outputs[0]["scores_3d"].numpy()
+                labels = outputs[0]["labels_3d"].numpy()
+                bboxes = LiDARInstance3DBoxes(bboxes, box_dim=9)
+            end_time = time.time()
+            inference_time = end_time - start_time
+            # means the computing power of my pc is /10  of  normal CUP
+            # it means vehicle do feaure extraction 0.2 and feature fusion 0.1  use the vehicle data
+            # if do voi we use 0.2 if not we use 0.3
+            vehicle_sem_comp_delay = (inference_time/10 ) * 0.2
+            vehicle_sem_comp_energy = vehicle.power_computing *vehicle_sem_comp_delay
+            # to simulate the more powerful computing power, the inference time will divide 50  at rsu
+            rsu_comp_delay = inference_time/50
+            # since it has on 0.4 feature extraction part be done in vehicle part  so the computing delay  
+            rsu_comp_sem_delay = rsu_comp_delay * 0.6
+            rsu_comp_sem_energy = rsu.power_computing * rsu_comp_sem_delay #  RSU_comp_value # J
+            rsu_comp_raw_energy = rsu.power_computing * rsu_comp_delay
+            rsu_comp_raw_delay = rsu_comp_delay  # it contians all part
+           
+      
+
+            
+
+            ## culculate the energy cosunpution 
+
+            # for raw part 
+            raw_total_energy  = raw_trans_energy + rsu_comp_raw_energy
+            raw_Total_delay  = raw_trans_delay + rsu_comp_raw_delay
+
+            # for semantic part
+            if decision ==1:
+                sem_total_energy  = vehicle_voi_comp_energy + vehicle_sem_comp_energy  + sem_trans_energy + rsu_comp_sem_energy
+                # sem_total_energy  =  vehicle_sem_comp_energy  + sem_trans_energy + rsu_comp_sem_energy
+                sem_total_delay = vehicle_voi_comp_delay + vehicle_sem_comp_delay+ sem_trans_delay + rsu_comp_sem_delay
+            else: 
+                sem_total_energy = vehicle_voi_comp_energy  +  rsu_comp_sem_energy
+                # sem_total_energy = rsu_comp_sem_energy
+                # sem_total_energy = vehicle_voi_comp_energy * 0.5  +  rsu_comp_sem_energy
+                sem_total_delay = vehicle_voi_comp_delay + rsu_comp_sem_delay
+
+            # sem_total_energy = raw_total_energy
+            # sem_total_delay = raw_Total_delay
+            # energy minimal our baseline 
+            energy_mini  = rsu_comp_sem_energy
+
+
+            print(f"sem_total_energy : {sem_total_energy:.4f} J")
+            print(f"raw_total_energy : {raw_total_energy:.4f} J")
+            print(f"energy_mini : {energy_mini:.4f} J")
+            # print(f"sem_total_delay : {sem_total_delay:.4f} J")
+            print(f"raw_Total_delay : {raw_Total_delay:.4f} J")
+    
+            # calcuate accuracy
+            ann = dataset.get_ann_info(i)  # 用 i 取当前样本 GT
+            gt_boxes = ann['gt_bboxes_3d']
+            gt_labels = ann['gt_labels_3d']
+            res = eval_one_frame_nus_centerdist(
+            gt_boxes, gt_labels, bboxes, labels,
+            dist_thrs=(2.0,),      # 或 (1.0, 2.0, 4.0)
+            classwise=True,        # 类内匹配（更合理）
+            return_matches=False)
+
+
+            ## Get only infrastructure accuracy 
+            Infra_accuracy = Accuracy_infra[i]
+            Full_accuracy = Accuracy_full[i]
+            # print("infrastructure accuracy", Infra_accuracy)
+            # if res < Infra_accuracy: 
+            #     res = Infra_accuracy
+            
+            # res = Infra_accuracy
+            ## calculate reward 
+            accuracy_gain = (res- Infra_accuracy)/ (1 -Infra_accuracy)
+            normalized_energy = (sem_total_energy - energy_mini) / (raw_total_energy - energy_mini)
+            alpha = 0.5
+            # energy_consume  = sem_total_energy - energy_mini
+            # enegy_saveing = raw_total_energy- sem_total_energy
+
+            reward = alpha * accuracy_gain - (1-alpha)* normalized_energy
+            # reward =  (alpha *  accuracy_gain) - (1-alpha)* energy_consume
+            # reward =  accuracy_gain +  enegy_saveing
+
+            # delay constraints: 
+            if sem_total_delay > Timeslot:
+                reward = -1 
+            if res < 0.7:
+                reward = -1 
+                # reward = -(0.7-res)
+            
+            print("step",i,"reward",reward,"accuracy", accuracy_gain,"energy", normalized_energy)
+            
+            total_reward +=  reward
+            # print("total_reward",total_reward) 
+            if (i+1) % ep_step == 0:
+
+                # print("!!!!!!!!!!!!!!!!!!!!!!",total_reward)
+                EP_reward.append (total_reward)
+                total_reward = 0
+
+          
+            Reward.append(reward)
+            Accuracy.append(res)
+            E2E_energy.append(sem_total_energy)
+            E2E_raw_energy.append(raw_total_energy)
+            E2E_mini_energy.append(energy_mini)
+  
+
+            
+            
+
+
+          
+
+
+            # state change
+            Decision.append (decision) 
+            if decision > 0: 
+                s_aoi = 0
+                previous_detections = current_detections
+            else: 
+                s_aoi += 1
+            
+            vehicle.move_model()
+            if i % 20 == 0 : 
+              vehicle.loc, vehicle.direction = generate_vehicle_positions(max_distance=Intersection_Range) 
+            
+
+                
+ 
+
+
+
+          
+    with open('Accuray-scmch.txt', 'w', encoding='utf-8') as f:
+        for item in Accuracy:
+            f.write(f"{item}\n")
+    with open('Decision-scmch.txt', 'w', encoding='utf-8') as f:
+        for item in Decision:
+            f.write(f"{item}\n")
+    # with open('VoI-t-2.txt', 'w', encoding='utf-8') as f:
+    #     for item in VoI:
+    #         f.write(f"{item}\n")
+    with open('EP-Reward-scmch.txt', 'w', encoding='utf-8') as f:
+        for item in EP_reward:
+            f.write(f"{item}\n")
+    with open('Energy-scmch.txt', 'w', encoding='utf-8') as f:
+        for item in E2E_energy:
+            f.write(f"{item}\n")
+    with open('Raw-energy-scmch.txt', 'w', encoding='utf-8') as f:
+        for item in E2E_raw_energy:
+            f.write(f"{item}\n")
+    with open('Mini-energy-scmch.txt', 'w', encoding='utf-8') as f:
+        for item in E2E_mini_energy:
+            f.write(f"{item}\n")
+
+
+
+
+
+    print("end!!!!!!!!!!!!!!!!!!!!!!!!!!!!")    
+    
+    return  Reward
+       
+if __name__ == "__main__":
+    Reward = main()
+    with open('Reward-scmch.txt', 'w', encoding='utf-8') as f:
+        for item in Reward:
+            f.write(f"{item}\n")
+   
