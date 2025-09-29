@@ -1,5 +1,5 @@
 
-# this code is for the nomarl ppo training and test
+# this code is for the nomarl  training and 
 # you can also improve the state or reward or more steps 
 
 # lagrange ppo
