@@ -1267,12 +1267,12 @@ def main() -> None:
     v_loc, v_d = generate_vehicle_positions(max_distance=Intersection_Range)
     vehicle = Vehicle(loc= v_loc, direction= v_d)
     rsu = RSU()
-    state_dim = 4 # importance,  change, aoi, action(upload or not)
+    state_dim = 6 # importance,  change, aoi, action(upload or not)
     action_dim = 1 # (1: upload, 0: no  )
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     agent_ddpg = DDPG(state_dim, action_dim,memory_size=8000,lr_a=0.0005,lr_c= 0.001)
-    actor_path  = "/home/coopdet3d/RL-model-scmch/actor_ep5_step300.pth"
-    critic_path = "/home/coopdet3d/RL-model-scmch/critic_ep5_step300.pth"
+    actor_path  = "/home/coopdet3d/RL-model-VoI2/actor_ep5_step300.pth"
+    critic_path = "/home/coopdet3d/RL-model-VoI2/critic_ep5_step300.pth"
 
     # actor_path  = "/home/coopdet3d/RL-model-VoI2-alpha6/actor_ep5_step300.pth"
     # critic_path = "/home/coopdet3d/RL-model-VoI2-alpha6/critic_ep5_step300.pth"
@@ -1477,19 +1477,19 @@ def main() -> None:
     
             if i == 0:
                 # state = [s_importance,s_change,s_aoi,decision, state_channal]
-                # state = [s_importance,s_change,s_aoi/3,decision,sc_state_drift,state_channal]
+                state = [s_importance,s_change,s_aoi/3,decision,sc_state_drift,state_channal]
                 # state = [s_aoi/3,decision]
                 # scmch ：
-                state = [s_change,sc_state_drift,decision,state_channal]
+                # state = [s_change,sc_state_drift,decision,state_channal]
                 # sc [s_change,decision]
                 # aoi
 
             else:
                 # next_state = [s_importance,s_change,s_aoi,decision, state_channal ]
-                # next_state = [s_importance,s_change,s_aoi/3,decision,sc_state_drift,state_channal]
+                next_state = [s_importance,s_change,s_aoi/3,decision,sc_state_drift,state_channal]
                 # next_state  = [s_aoi/3,decision]
                 # #   
-                next_state= [s_change,sc_state_drift,decision,state_channal]
+                # next_state= [s_change,sc_state_drift,decision,state_channal]
                 # agent_ddpg.replay_buffer.push((state, action,next_state, reward ))
                 state = next_state 
             
@@ -1497,9 +1497,8 @@ def main() -> None:
             ### action chose 
     
     
-            # 循环内
+       
             # acc_30 += r_star_30
-            # # # 让上传发生在 AoI 足够大的时刻，这里设为不短于间隔=3 → s_aoi>=2
             # if acc_30 >= 1.0 and s_aoi >= 1:
             #     action = np.array([1])
             #     acc_30 -= 1.0
@@ -1507,20 +1506,15 @@ def main() -> None:
             #     action = np.array([-1])
             # bucket = min(capacity1, bucket + r_star_50)
 
-            # # 令牌>=1 且（给一点随机性），就发；允许 d=1
-            # if bucket >= 1.0 and (np.random.rand() < 0.90) and s_aoi >= 0:
-            #     action = np.array([1])
-            #     bucket -= 1.0
-            # else:
-            #     action = np.array([-1])
+
 
          
-            # if np.random.rand() < 0.70:   # 25% 概率上传
+            # if np.random.rand() < 0.70:   
             #     action = np.array([1])
             # else:
             #     action = np.array([-1])
 
-            # if s_change > 0.5:
+            # if s_change > 0.28:
             #     action =  np.array([1])
             # else: 
             #     action =  np.array([-1])
@@ -1628,13 +1622,13 @@ def main() -> None:
             print(f"raw_Total_delay : {raw_Total_delay:.4f} J")
     
             # calcuate accuracy
-            ann = dataset.get_ann_info(i)  # 用 i 取当前样本 GT
+            ann = dataset.get_ann_info(i) 
             gt_boxes = ann['gt_bboxes_3d']
             gt_labels = ann['gt_labels_3d']
             res = eval_one_frame_nus_centerdist(
             gt_boxes, gt_labels, bboxes, labels,
-            dist_thrs=(2.0,),      # 或 (1.0, 2.0, 4.0)
-            classwise=True,        # 类内匹配（更合理）
+            dist_thrs=(2.0,),    
+            classwise=True,       
             return_matches=False)
 
 
@@ -1642,8 +1636,8 @@ def main() -> None:
             Infra_accuracy = Accuracy_infra[i]
             Full_accuracy = Accuracy_full[i]
             # print("infrastructure accuracy", Infra_accuracy)
-            # if res < Infra_accuracy: 
-            #     res = Infra_accuracy
+            if res < Infra_accuracy: 
+                res = Infra_accuracy
             
             # res = Infra_accuracy
             ## calculate reward 
@@ -1708,25 +1702,25 @@ def main() -> None:
 
 
           
-    with open('Accuray-scmch.txt', 'w', encoding='utf-8') as f:
+    with open('Accuray-test.txt', 'w', encoding='utf-8') as f:
         for item in Accuracy:
             f.write(f"{item}\n")
-    with open('Decision-scmch.txt', 'w', encoding='utf-8') as f:
+    with open('Decision-test.txt', 'w', encoding='utf-8') as f:
         for item in Decision:
             f.write(f"{item}\n")
     # with open('VoI-t-2.txt', 'w', encoding='utf-8') as f:
     #     for item in VoI:
     #         f.write(f"{item}\n")
-    with open('EP-Reward-scmch.txt', 'w', encoding='utf-8') as f:
+    with open('EP-Reward-test.txt', 'w', encoding='utf-8') as f:
         for item in EP_reward:
             f.write(f"{item}\n")
-    with open('Energy-scmch.txt', 'w', encoding='utf-8') as f:
+    with open('Energy-test.txt', 'w', encoding='utf-8') as f:
         for item in E2E_energy:
             f.write(f"{item}\n")
-    with open('Raw-energy-scmch.txt', 'w', encoding='utf-8') as f:
+    with open('Raw-energy-test.txt', 'w', encoding='utf-8') as f:
         for item in E2E_raw_energy:
             f.write(f"{item}\n")
-    with open('Mini-energy-scmch.txt', 'w', encoding='utf-8') as f:
+    with open('Mini-energy-test.txt', 'w', encoding='utf-8') as f:
         for item in E2E_mini_energy:
             f.write(f"{item}\n")
 
@@ -1740,7 +1734,7 @@ def main() -> None:
        
 if __name__ == "__main__":
     Reward = main()
-    with open('Reward-scmch.txt', 'w', encoding='utf-8') as f:
+    with open('Reward-test.txt', 'w', encoding='utf-8') as f:
         for item in Reward:
             f.write(f"{item}\n")
    
