@@ -102,55 +102,15 @@ critic_path = "path/to/critic.pth"
 
 ## Step 4: Run RL-VoIS
 
-We provide trained RL-VoIS models for reproducing the main results. Therefore, users can directly run the evaluation script without retraining the RL agent.
-
-Run:
-
-```bash
-python Test_coop.py <CONFIG_FILE> \
-    --mode pred \
-    --checkpoint <COOPDET3D_CHECKPOINT> \
-    --split val
-```
-
-Example:
-
-```bash
-python Test_coop.py configs/your_config.py \
-    --mode pred \
-    --checkpoint checkpoints/your_coopdet3d_checkpoint.pth \
-    --split val
-```
+We provide trained RL-VoIS models for reproducing the main results. Therefore, users can directly run the evaluation script without retraining the RL agent, by import those models 
+"   actor_path  = "/home/coopdet3d/RL-model-VoI2/actor_ep5_step300.pth"
+    critic_path = "/home/coopdet3d/RL-model-VoI2/critic_ep5_step300.pth""
 
 The script loads the trained RL-VoIS agent and evaluates adaptive upload decisions on the cooperative perception dataset.
 
 ## Optional: Train RL-VoIS from Scratch
 
-If you want to retrain the RL-VoIS agent, run:
-
-```bash
-python Training_coop.py <CONFIG_FILE> \
-    --mode pred \
-    --checkpoint <COOPDET3D_CHECKPOINT> \
-    --split val \
-    --save_dir ./RL-model/
-```
-
-Example:
-
-```bash
-python Training_coop.py configs/your_config.py \
-    --mode pred \
-    --checkpoint checkpoints/your_coopdet3d_checkpoint.pth \
-    --split val \
-    --save_dir ./RL-model/
-```
-
-The trained actor and critic models will be saved in:
-
-```text
-./RL-model/
-```
+If you want to retrain the RL-VoIS agent, run: Tranining_coop.py
 
 For reproducing the paper results, we recommend using the provided trained models.
 
@@ -221,6 +181,7 @@ Please also cite the original CoopDet3D work if you use the CoopDet3D codebase, 
 ## Acknowledgement
 
 This implementation is based on the CoopDet3D framework and the TUMTraf-V2X cooperative perception dataset.
+FNS 6G Dutch Project 
 
 ## Contact
 
