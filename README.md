@@ -189,5 +189,5 @@ For questions, please contact:
 
 ```text
 Qianqian Liu
-GitHub: https://github.com/Qqianliu
+qianqian.liu@utwente.nl
 ```
