@@ -1271,12 +1271,17 @@ def main() -> None:
     action_dim = 1 # (1: upload, 0: no  )
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     agent_ddpg = DDPG(state_dim, action_dim,memory_size=8000,lr_a=0.0005,lr_c= 0.001)
-    actor_path  = "/home/coopdet3d/RL-model-VoI2/actor_ep5_step300.pth"
-    critic_path = "/home/coopdet3d/RL-model-VoI2/critic_ep5_step300.pth"
+    # Paths to the trained RL-VoIS models and the baseline accuracy files.
+    # Override on the command line, e.g. --actor Trained-models/Alpha2/actor_ep5_step300.pth
+    rl_parser = argparse.ArgumentParser(add_help=False)
+    rl_parser.add_argument("--actor", type=str, default="Trained-models/Alpha2/actor_ep5_step300.pth")
+    rl_parser.add_argument("--critic", type=str, default="Trained-models/Alpha2/critic_ep5_step300.pth")
+    rl_parser.add_argument("--reward-infras", type=str, default="Reward-infras.txt")
+    rl_parser.add_argument("--reward-full", type=str, default="Reward-full-1.txt")
+    rl_args, _ = rl_parser.parse_known_args()
+    actor_path = rl_args.actor
+    critic_path = rl_args.critic
 
-    # actor_path  = "/home/coopdet3d/RL-model-VoI2-alpha6/actor_ep5_step300.pth"
-    # critic_path = "/home/coopdet3d/RL-model-VoI2-alpha6/critic_ep5_step300.pth"
-   
     agent_ddpg.load(actor_path, critic_path, device=device)
     agent_ddpg.actor.eval()
 
@@ -1288,6 +1293,10 @@ def main() -> None:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("config", metavar="FILE")
+    parser.add_argument("--actor", type=str)
+    parser.add_argument("--critic", type=str)
+    parser.add_argument("--reward-infras", type=str)
+    parser.add_argument("--reward-full", type=str)
     parser.add_argument("--mode", type=str, default="gt", choices=["gt", "pred", "combo"])
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
@@ -1382,10 +1391,10 @@ def main() -> None:
     done = False
     # constraint_violations = []
     # prapare the infrastructure ddata 
-    with open( '/home/coopdet3d/Reward-infras.txt', 'r', encoding='utf-8') as f:
+    with open(rl_args.reward_infras, 'r', encoding='utf-8') as f:
              Accuracy_infra = [float(line.strip()) for line in f if line.strip()]
 
-    with open( '/home/coopdet3d/Reward-full-1.txt', 'r', encoding='utf-8') as f:
+    with open(rl_args.reward_full, 'r', encoding='utf-8') as f:
              Accuracy_full = [float(line.strip()) for line in f if line.strip()]
     # print(len(Accuracy_infra),type(Accuracy_infra))
     MAX_EPISODE = 1
