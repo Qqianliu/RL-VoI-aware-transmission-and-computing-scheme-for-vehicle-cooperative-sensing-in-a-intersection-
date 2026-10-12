@@ -1144,7 +1144,7 @@ def apply_upload_decision(data, last_valid_data, upload_decision):
 def evaluate_single_frame(gt_bboxes, gt_labels, pred_bboxes, pred_labels, scores=None, iou_thresh=0.5):
 
     # 计算 IoU 矩阵 (pred x gt)
-    ious = bbox_overlaps_3d(pred_bboxes, gt_bboxes).cpu().numpy()
+    ious = bbox_overlaps_3d(pred_bboxes, gt_bboxes, coordinate="lidar").cpu().numpy()
 
     matched_gt = set()
     tp = 0

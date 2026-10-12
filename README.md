@@ -1,193 +1,144 @@
 # Learning to Sense: Efficient Semantic Transmission for Cooperative Object Detection at Intersections
 
-This repository provides the implementation of **RL-VoIS**, a reinforcement learning-based value-aware semantic transmission framework for cooperative object detection at intersections.
+This repository contains the code of **RL-VoIS**, a reinforcement learning (DDPG) framework that decides when a vehicle uploads its sensing data to a roadside unit (RSU), based on the Value of Information (VoI) of camera images, the wireless channel and the energy cost. It is built on top of [CoopDet3D](https://github.com/tum-traffic-dataset/coopdet3d) and evaluated on the TUMTraf-V2X cooperative perception dataset.
 
-The implementation is built on top of **CoopDet3D: Deep Multi-Modal Cooperative 3D Object Detection of Traffic Participants Using Onboard and Roadside Sensors**. We use CoopDet3D as the cooperative perception backbone and extend it with Value of Information (VoI)-based transmission control and reinforcement learning-based upload decision-making.
+## Research information
 
-## Code Overview
+- **Paper**: Q. Liu, S. Bayhan, Y. Huang and G. Heijenk, "Learning to Sense: Efficient Semantic Transmission for Cooperative Object Detection at Intersections," *2026 IEEE Vehicular Networking Conference (VNC)*, Montreal, QC, Canada, 2026, pp. 1-8.
+- **DOI**: [10.1109/VNC69225.2026.11629173](https://doi.org/10.1109/VNC69225.2026.11629173)
+- **Author / contact**: Qianqian Liu, University of Twente (qianqian.liu@utwente.nl)
 
-The main scripts are:
+## Repository contents
 
-```text
-Trained-models       # Pre-trained RL models
-Training_coop.py     # Train the RL-VoIS agent
-Test_coop.py         # Evaluate a trained RL-VoIS agent
+| Path | Description |
+|------|-------------|
+| `Test_coop.py` | Evaluates a trained RL-VoIS agent (**use this to reproduce the results**) |
+| `Training_coop.py` | Trains the RL-VoIS agent from scratch (optional) |
+| `Trained-models/Alpha0` … `Alpha6` | Trained DDPG actor/critic weights, one folder per value of the reward weight α (`Alpha5-ac_th-infras` is an additional variant). All share the same network shape and can be used interchangeably with `Test_coop.py`. |
+| `Reward-infras.txt` | Per-frame detection accuracy when only infrastructure data is used (baseline read by `Test_coop.py`, 400 frames) |
+| `Reward-full-1.txt` | Per-frame detection accuracy when all vehicle data is uploaded (baseline read by `Test_coop.py`, 400 frames) |
+| `mmdet3d/models2/` | Modified copy of CoopDet3D's `mmdet3d/models`, imported by both scripts (`from mmdet3d.models2 import build_coop_model`) |
+| `docker/Dockerfile` | Docker environment used for the experiments (CoopDet3D's Dockerfile with small changes) |
+
+## Requirements
+
+- Linux with an **NVIDIA GPU** and CUDA (the code calls `torch.cuda.set_device(0)`; CPU-only is not supported). Experiments were run in the Docker image below.
+- Software (installed by the Dockerfile): Python 3.9, PyTorch 1.10.1 + CUDA 11.3, mmcv-full 1.4.0, mmdet 2.20.0, torchpack, torchsparse, numba, pypcd, open3d.
+- YOLOv5 from [ultralytics/yolov5](https://github.com/ultralytics/yolov5), commit `d3ea0df` (2022-08-17). Newer versions renamed `scale_coords`, which the scripts import.
+
+## Step-by-step reproduction
+
+### 1. Get CoopDet3D and add the RL-VoIS files
+
+```bash
+git clone https://github.com/tum-traffic-dataset/coopdet3d.git
+git clone https://github.com/Qqianliu/rl-voi-aware-transmission-and-computing-scheme-for-vehicle-cooperative-sensing-in-a-intersection- rlvois
+
+# copy the RL-VoIS files into the CoopDet3D root
+cp -r rlvois/Test_coop.py rlvois/Training_coop.py rlvois/Reward-infras.txt rlvois/Reward-full-1.txt rlvois/Trained-models coopdet3d/
+cp -r rlvois/mmdet3d/models2 coopdet3d/mmdet3d/
+cp rlvois/docker/Dockerfile coopdet3d/docker/Dockerfile
+cd coopdet3d
 ```
 
-RL-VoIS includes:
+### 2. Get YOLOv5 (for the VoI calculation)
 
-* image-based VoI calculation using YOLO object detection output;
-* channel-aware vehicle-to-RSU transmission simulation;
-* end-to-end energy consumption calculation;
-* DDPG-based RL agent for adaptive upload decisions;
-* cooperative 3D object detection evaluation using the CoopDet3D backbone.
-
-## Step 1: Prepare CoopDet3D
-
-First, clone and install the original CoopDet3D framework following its official instructions.
-
-Our RL-VoIS scripts should be placed inside the CoopDet3D project directory.
-
-A typical project structure is:
-
-```text
-coopdet3d/
-├── mmdet3d/
-├── tools/
-├── configs/
-├── data/
-├── checkpoints/
-├── RL-model/
-├── Training_coop.py
-├── Test_coop.py
-└── yolov5s.pt
+```bash
+git clone https://github.com/ultralytics/yolov5.git
+cd yolov5 && git checkout d3ea0df && cd ..
+wget https://github.com/ultralytics/yolov5/releases/download/v6.2/yolov5s.pt   # place in the CoopDet3D root
 ```
 
-## Step 2: Prepare the Dataset
+### 3. Build and start the Docker environment
 
-This work uses the **TUMTraf-V2X Cooperative Perception Dataset** adopted by CoopDet3D.
-
-Please download either:
-
-* `TUMTraf-V2X`
-* or `TUMTraf-V2X-mini`
-
-Then place the dataset under the `data/` directory following the CoopDet3D format:
-
-```text
-coopdet3d/
-├── data/
-│   ├── tumtraf_v2x_cooperative_perception_dataset/
-│   │   ├── train/
-│   │   ├── val/
+```bash
+cd docker && docker build . -t coopdet3d && cd ..
+nvidia-docker run -it \
+  -v <PATH_TO_DATASET>/tumtraf_v2x_cooperative_perception_dataset:/home/data/tumtraf_v2x_cooperative_perception_dataset \
+  -v `pwd`:/home/coopdet3d --shm-size 16g coopdet3d /bin/bash
 ```
 
-Make sure the dataset path is correctly set in the CoopDet3D config file.
+Inside the container:
 
-## Step 3: Prepare Models and Required Files
-
-Before running RL-VoIS, please prepare:
-
-1. A pretrained CoopDet3D checkpoint. (i chosed the best one)
-
-```text
- coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth
-```
-2. YOLOv5 weights for image-based VoI calculation:
-
-```text
-yolov5s.pt
+```bash
+cd /home/coopdet3d
+python setup.py develop
+pip install -r yolov5/requirements.txt
+export PYTHONPATH=/home/coopdet3d/yolov5:$PYTHONPATH   # needed because YOLOv5 uses "from utils..." imports
 ```
 
-3. The provided trained RL-VoIS actor and critic models:
+### 4. Prepare the dataset
 
-```text
-actor_*.pth
-critic_*.pth
+Download **TUMTraf-V2X** (or **TUMTraf-V2X-mini**) from the [TUMTraf dataset page](https://innovation-mobility.com/tumtraf-dataset), link it to `data/tumtraf_v2x_cooperative_perception_dataset` (with `train/` and `val/` inside), then run CoopDet3D's preprocessing:
+
+```bash
+mkdir -p data
+ln -s /home/data/tumtraf_v2x_cooperative_perception_dataset data/tumtraf_v2x_cooperative_perception_dataset
+python ./tools/create_tumtraf_v2x_data.py \
+  --root-path /home/coopdet3d/data/tumtraf_v2x_cooperative_perception_dataset \
+  --out-dir /home/coopdet3d/data/tumtraf_v2x_cooperative_perception_dataset_processed \
+  --splits training,validation
 ```
 
-4. Baseline accuracy files used for reward calculation:
+### 5. Download the pretrained CoopDet3D checkpoint
 
-```text
-Reward-infras.txt
-Reward-full-1.txt
+Download `coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth` from the [CoopDet3D README](https://github.com/tum-traffic-dataset/coopdet3d) (section "Pretrained Weights") and place it in `weights/`.
+
+### 6. Run the evaluation
+
+```bash
+python Test_coop.py configs/tumtraf_v2x/det/transfusion/secfpn/cooperative/camera+lidar/yolov8/pointpillars.yaml \
+  --mode pred \
+  --checkpoint weights/coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth \
+  --actor Trained-models/Alpha2/actor_ep5_step300.pth \
+  --critic Trained-models/Alpha2/critic_ep5_step300.pth
 ```
 
-Please update the file paths in `Test_coop.py` if needed, especially:
+Notes:
+- `--mode pred` is required: it loads the CoopDet3D model.
+- Any `Trained-models/AlphaX` folder can be passed to `--actor` / `--critic`.
+- `--reward-infras` and `--reward-full` default to the two baseline files in the current directory.
+- The random seed is fixed to 17 in `Test_coop.py`.
 
-```python
-actor_path = "path/to/actor.pth"
-critic_path = "path/to/critic.pth"
+### 7. Outputs
+
+The script writes these files to the working directory (one value per line):
+
+| File | Content |
+|------|---------|
+| `Accuray-test.txt` | Detection accuracy per frame |
+| `Decision-test.txt` | Upload decision per frame (1 = upload, 0 = no upload) |
+| `Reward-test.txt`, `EP-Reward-test.txt` | Reward per step / per episode |
+| `Energy-test.txt` | End-to-end energy of RL-VoIS |
+| `Raw-energy-test.txt` | Energy when raw data is always transmitted |
+| `Mini-energy-test.txt` | Minimum-energy reference |
+
+Averaging these files gives the accuracy, upload ratio and energy figures reported in the paper.
+
+## Optional: train from scratch
+
+```bash
+python Training_coop.py configs/tumtraf_v2x/det/transfusion/secfpn/cooperative/camera+lidar/yolov8/pointpillars.yaml \
+  --mode pred \
+  --checkpoint weights/coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth \
+  --save_dir ./RL-model-new/
 ```
-
-## Step 4: Run RL-VoIS
-
-We provide trained RL-VoIS models for reproducing the main results. Therefore, users can directly run the evaluation script without retraining the RL agent, by import those models 
-"   actor_path  = "/home/coopdet3d/RL-model-VoI2/actor_ep5_step300.pth"
-    critic_path = "/home/coopdet3d/RL-model-VoI2/critic_ep5_step300.pth""
-
-The script loads the trained RL-VoIS agent and evaluates adaptive upload decisions on the cooperative perception dataset.
-
-## Optional: Train RL-VoIS from Scratch
-
-If you want to retrain the RL-VoIS agent, run: Tranining_coop.py
-
-For reproducing the paper results, we recommend using the provided trained models.
-
-## Output Files
-
-The evaluation script generates `.txt` files for result analysis.
-
-Typical output files include:
-
-```text
-Accuray-test.txt
-Decision-test.txt
-EP-Reward-test.txt
-Energy-test.txt
-Raw-energy-test.txt
-Mini-energy-test.txt
-Reward-test.txt
-```
-
-These files record:
-
-* detection accuracy;
-* upload decisions;
-* reward values;
-* RL-VoIS energy consumption;
-* raw transmission energy consumption;
-* minimum-energy reference values.
-
-If training from scratch, additional training logs may be generated, such as:
-
-```text
-Accuray-scmch0.txt
-Decision-scmch0.txt
-EP-Reward-scmch0.txt
-Energy-scmch0.txt
-Raw-energy-scmch0.txt
-Mini-energy-scmch0.txt
-Reward-scmch.txt
-```
-
-## Reproducing the Main Results
-
-To reproduce the main results:
-
-1. Install CoopDet3D and its dependencies.
-2. Download and prepare the TUMTraf-V2X dataset.
-3. Download the pretrained CoopDet3D checkpoint.
-4. Place `Test_coop.py`, `yolov5s.pt`, the trained RL-VoIS models, and the baseline accuracy files in the CoopDet3D project directory.
-5. Update the paths of the actor, critic, dataset, and checkpoint.
-6. Run `Test_coop.py`.
-7. Use the generated `.txt` files to compute accuracy, data volume, energy consumption, and upload decision statistics.
 
 ## Citation
-
-If you use this code, please cite our work:
 
 ```bibtex
 @inproceedings{liu2026learning,
   title     = {Learning to Sense: Efficient Semantic Transmission for Cooperative Object Detection at Intersections},
   author    = {Liu, Qianqian and Bayhan, Suzan and Huang, Yanqiu and Heijenk, Geert},
-  booktitle = {IEEE Vehicular Networking Conference (VNC)},
-  year      = {2026}
+  booktitle = {2026 IEEE Vehicular Networking Conference (VNC)},
+  pages     = {1--8},
+  year      = {2026},
+  doi       = {10.1109/VNC69225.2026.11629173}
 }
 ```
 
-Please also cite the original CoopDet3D work if you use the CoopDet3D codebase, pretrained models, or TUMTraf-V2X dataset.
+Please also cite CoopDet3D and the TUMTraf-V2X dataset if you use their code, checkpoints or data.
 
 ## Acknowledgement
 
-This implementation is based on the CoopDet3D framework and the TUMTraf-V2X cooperative perception dataset.
-FNS 6G Dutch Project 
-
-## Contact
-
-For questions, please contact:
-
-```text
-Qianqian Liu
-qianqian.liu@utwente.nl
-```
+This implementation is based on the [CoopDet3D](https://github.com/tum-traffic-dataset/coopdet3d) framework and the TUMTraf-V2X cooperative perception dataset. This work is part of the FNS 6G Dutch project.
