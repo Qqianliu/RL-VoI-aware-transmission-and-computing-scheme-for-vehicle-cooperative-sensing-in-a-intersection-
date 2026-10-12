@@ -41,21 +41,34 @@ cp rlvois/docker/Dockerfile coopdet3d/docker/Dockerfile
 cd coopdet3d
 ```
 
-### 2. Get YOLOv5 (for the VoI calculation)
+### 2. Get the data, checkpoint and YOLOv5 (reproduction package)
+
+Download the reproduction package from the link below (to be added before the CodeCheck session):
+
+> **Download link:** _will be added here_
+ It consists of 7 zip files, `codecheck_data_part1of7.zip` … `codecheck_data_part7of7.zip` (1.36 GB in total). Unzip all of them **in the CoopDet3D root**:
 
 ```bash
-git clone https://github.com/ultralytics/yolov5.git
-cd yolov5 && git checkout d3ea0df && cd ..
-wget https://github.com/ultralytics/yolov5/releases/download/v6.2/yolov5s.pt   # place in the CoopDet3D root
+cd coopdet3d
+for f in /path/to/codecheck_data_part*of7.zip; do unzip -o "$f"; done
 ```
+
+It contains exactly what `Test_coop.py` needs, already in the right place:
+
+| Path | Content |
+|------|---------|
+| `data/tumtraf_v2x_cooperative_perception_dataset_mini/val/` | Validation split of TUMTraf-V2X-mini (images, labels) |
+| `data/tumtraf_v2x_cooperative_perception_dataset_processed/val/` + `*.pkl` | Preprocessed point clouds and info files (output of CoopDet3D's `create_tumtraf_v2x_data.py`) |
+| `weights/coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth` | Pretrained CoopDet3D checkpoint |
+| `yolov5/`, `yolov5s.pt` | YOLOv5 code (commit `d3ea0df`) and weights for the VoI calculation |
+
+**Important:** the `.pkl` info files store absolute paths starting with `/home/coopdet3d/`, so the CoopDet3D folder must be mounted at `/home/coopdet3d` (the Docker command below does this). With the package, steps 4 and 5 can be skipped.
 
 ### 3. Build and start the Docker environment
 
 ```bash
 cd docker && docker build . -t coopdet3d && cd ..
-nvidia-docker run -it \
-  -v <PATH_TO_DATASET>/tumtraf_v2x_cooperative_perception_dataset:/home/data/tumtraf_v2x_cooperative_perception_dataset \
-  -v `pwd`:/home/coopdet3d --shm-size 16g coopdet3d /bin/bash
+nvidia-docker run -it -v `pwd`:/home/coopdet3d --shm-size 16g coopdet3d /bin/bash
 ```
 
 Inside the container:
@@ -67,7 +80,7 @@ pip install -r yolov5/requirements.txt
 export PYTHONPATH=/home/coopdet3d/yolov5:$PYTHONPATH   # needed because YOLOv5 uses "from utils..." imports
 ```
 
-### 4. Prepare the dataset
+### 4. (Only without the package) Prepare the dataset
 
 Download **TUMTraf-V2X** (or **TUMTraf-V2X-mini**) from the [TUMTraf dataset page](https://innovation-mobility.com/tumtraf-dataset), link it to `data/tumtraf_v2x_cooperative_perception_dataset` (with `train/` and `val/` inside), then run CoopDet3D's preprocessing:
 
@@ -80,9 +93,15 @@ python ./tools/create_tumtraf_v2x_data.py \
   --splits training,validation
 ```
 
-### 5. Download the pretrained CoopDet3D checkpoint
+### 5. (Only without the package) Download the checkpoint and YOLOv5
 
-Download `coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth` from the [CoopDet3D README](https://github.com/tum-traffic-dataset/coopdet3d) (section "Pretrained Weights") and place it in `weights/`.
+Download `coopdet3d_vi_cl_pointpillars512_2xtestgrid_yolos_transfer_learning_best.pth` from the [CoopDet3D README](https://github.com/tum-traffic-dataset/coopdet3d) (section "Pretrained Weights") and place it in `weights/`. Then:
+
+```bash
+git clone https://github.com/ultralytics/yolov5.git
+cd yolov5 && git checkout d3ea0df && cd ..
+wget https://github.com/ultralytics/yolov5/releases/download/v6.2/yolov5s.pt   # place in the CoopDet3D root
+```
 
 ### 6. Run the evaluation
 
